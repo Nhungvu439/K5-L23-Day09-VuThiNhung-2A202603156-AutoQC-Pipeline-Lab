@@ -40,5 +40,120 @@ from ..model_cache import get_preds  # noqa: F401
 
 
 def run(ds, cfg, preds=None):
-    # TODO
-    raise NotImplementedError("check second_opinion chưa làm")
+    if preds is None:
+        preds = get_preds(ds, cfg, "checker")
+
+    c = cfg["second_opinion"]
+    conf_thresh = c["conf"]
+    min_area_px = c["min_area_px"]
+    fp_conf = c["fp_conf"]
+    iou_missing = c["iou_missing"]
+    iou_match = c["iou_match"]
+    iou_loose = c["iou_loose"]
+    n_classes = len(ds.classes)
+
+    issues = []
+
+    for img_path in ds.image_files():
+        stem = img_path.stem
+        if stem not in preds or not ds.label_path(stem).exists():
+            continue
+        img_size = ds.image_size(stem)
+        if img_size is None:
+            continue
+        img_w, img_h = img_size
+
+        valid_lines = []
+        for line_no, ln in ds.read_label_lines(stem) or []:
+            try:
+                cls_id, cx, cy, w, h = parse_yolo_line(ln)
+            except ValueError:
+                continue
+            if 0 <= cls_id < n_classes and w > 0 and h > 0:
+                valid_lines.append((line_no, cls_id, (cx, cy, w, h)))
+
+        img_preds = preds[stem]
+
+        # 1. Duyệt từng dự đoán của model có conf >= conf_thresh và diện tích px >= min_area_px
+        for r in img_preds:
+            p_cls, p_conf, pcx, pcy, pw, ph = int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])
+            if p_conf < conf_thresh:
+                continue
+            if (pw * img_w) * (ph * img_h) < min_area_px:
+                continue
+
+            p_box = (pcx, pcy, pw, ph)
+            cands = []
+            for _, l_cls, l_box in valid_lines:
+                iou = iou_xywh(p_box, l_box)
+                if iou >= iou_missing:
+                    cands.append((l_cls, iou))
+
+            if not cands:
+                issues.append(
+                    Issue(
+                        "second_opinion",
+                        WARN,
+                        "POSSIBLE_MISSING",
+                        stem,
+                        f"model thấy lớp {p_cls} (conf={p_conf:.2f}) nhưng nhãn không có box",
+                        extra={"conf": round(p_conf, 4), "pred_class": p_cls},
+                    )
+                )
+                continue
+
+            same_cands = [iou for l_cls, iou in cands if l_cls == p_cls]
+            if same_cands:
+                best_same_iou = max(same_cands)
+                if best_same_iou < iou_loose:
+                    issues.append(
+                        Issue(
+                            "second_opinion",
+                            WARN,
+                            "POSSIBLE_LOOSE_BOX",
+                            stem,
+                            f"box lớp {p_cls} lỏng/lệch so với model (IoU={best_same_iou:.2f})",
+                            extra={"conf": round(p_conf, 4), "iou": round(best_same_iou, 4)},
+                        )
+                    )
+            else:
+                best_other_cls, best_other_iou = max(cands, key=lambda x: x[1])
+                if best_other_iou >= iou_match:
+                    issues.append(
+                        Issue(
+                            "second_opinion",
+                            WARN,
+                            "POSSIBLE_WRONG_CLASS",
+                            stem,
+                            f"nhãn lớp {best_other_cls} nhưng model dự đoán lớp {p_cls} (conf={p_conf:.2f}, IoU={best_other_iou:.2f})",
+                            extra={
+                                "conf": round(p_conf, 4),
+                                "iou": round(best_other_iou, 4),
+                                "label_class": best_other_cls,
+                                "pred_class": p_cls,
+                            },
+                        )
+                    )
+
+        # 2. Duyệt từng dòng nhãn hợp lệ để tìm POSSIBLE_FALSE_POS (dùng fp_conf, không lọc diện tích)
+        fp_boxes = [
+            (float(r[2]), float(r[3]), float(r[4]), float(r[5]))
+            for r in img_preds
+            if float(r[1]) >= fp_conf
+        ]
+        for line_no, l_cls, l_box in valid_lines:
+            max_iou = max((iou_xywh(l_box, pb) for pb in fp_boxes), default=0.0)
+            if max_iou < iou_missing:
+                issues.append(
+                    Issue(
+                        "second_opinion",
+                        WARN,
+                        "POSSIBLE_FALSE_POS",
+                        stem,
+                        f"box dòng {line_no} (lớp {l_cls}) không khớp dự đoán nào của model (max IoU={max_iou:.2f})",
+                        line=line_no,
+                        extra={"iou": round(max_iou, 4), "label_class": l_cls},
+                    )
+                )
+
+    return issues
